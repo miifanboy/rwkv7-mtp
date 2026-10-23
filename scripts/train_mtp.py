@@ -42,12 +42,12 @@ import os
 import random
 import sys
 import time
-
 import numpy as np
 import torch
 
 import mtp
 from mtp import build_frozen_model, mtp_parameters, save_mtp_heads
+from trackio_helper import TrackioRun
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +272,14 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--val-every", type=int, default=250)
     ap.add_argument("--val-chunks", type=int, default=16)
     ap.add_argument("--out", default="mtp_out")
+    ap.add_argument("--trackio-project", default="",
+                    help="trackio project name (LOCAL logging only; view with "
+                         "'trackio show --project <name>'); empty (default) "
+                         "disables trackio logging entirely")
+    ap.add_argument("--trackio-run", default="",
+                    help="trackio run name (default: the --out directory "
+                         "basename, so restarting from a checkpoint with the "
+                         "same --out resumes the same run)")
     ap.add_argument("--check-only", action="store_true",
                     help="build the model, verify the freeze, print stats, exit")
     return ap.parse_args(argv)
@@ -414,9 +422,10 @@ def main(argv=None) -> None:
     log_f.write(f"NEW RUN {_dt.datetime.now().isoformat()} {vars(args)}\n")
     log_f.flush()
     run_name = os.path.basename(os.path.normpath(args.out))
-    _emit_metrics(args.out, {"t": _dt.datetime.now().isoformat(timespec="seconds"),
-                             "type": "run_start", "src": "live", "run": run_name,
-                             "run_idx": run_idx, "args": vars(args)})
+    run_start_rec = {"t": _dt.datetime.now().isoformat(timespec="seconds"),
+                     "type": "run_start", "src": "live", "run": run_name,
+                     "run_idx": run_idx, "args": vars(args)}
+    _emit_metrics(args.out, run_start_rec)
 
     print(f"[train_mtp] torch={torch.__version__} cuda={torch.version.cuda} device={args.device}")
 
@@ -579,6 +588,21 @@ def main(argv=None) -> None:
         val_offsets = _all_offsets(vds.n_tokens, args.ctx_len, args.val_chunks)
         _announce(f"val: {len(val_offsets)} chunks of {args.ctx_len}")
 
+    # ---- trackio (optional) -----------------------------------------------------
+    # Buffered, checkpoint-gated logging: records only reach trackio when a
+    # checkpoint is actually saved (see _save), so the logged step range always
+    # ends at a real checkpoint.  Restarting from that checkpoint resumes the
+    # SAME trackio run (resume="allow" inside TrackioRun, keyed on the run
+    # name) and keeps logging with explicit step numbers -- no orphaned rows
+    # beyond the checkpoint ever exist, so nothing has to be deleted.
+    tracker = TrackioRun(
+        args.trackio_project,
+        name=args.trackio_run or run_name,
+        config=dict(vars(args)),
+        tag="train_mtp",
+    )
+    tracker.buffer(run_start_rec)
+
     # ---- optimizer -------------------------------------------------------------
     opt = torch.optim.AdamW(
         params, lr=args.lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=args.weight_decay
@@ -595,7 +619,7 @@ def main(argv=None) -> None:
         except Exception as e:
             print(f"[train_mtp] WARNING: optimizer state NOT restored ({e}); "
                   f"Adam moments restart from zero (weights and LR schedule unaffected)")
-
+    
     model.train()
     t0 = time.time()
     tokens_seen = start_tokens
@@ -687,6 +711,7 @@ def main(argv=None) -> None:
                 if f"alpha_{d + 1}" in running:
                     rec[f"alpha{d + 1}"] = running[f"alpha_{d + 1}"]
             _emit_metrics(args.out, rec)
+            tracker.buffer(rec)
 
         if vds is not None and args.val_every > 0 and (step + 1) % args.val_every == 0:
             vp = _validate(model, vds, val_offsets, args.batch_size,
@@ -724,17 +749,19 @@ def main(argv=None) -> None:
                 if f"alpha_{d + 1}" in vp:
                     rec[f"alpha{d + 1}"] = vp[f"alpha_{d + 1}"]
             _emit_metrics(args.out, rec)
+            tracker.buffer(rec)
 
         if args.save_every > 0 and (step + 1) % args.save_every == 0:
-            _save(model, args, step, tokens_seen, opt, rng)
+            _save(model, args, step, tokens_seen, opt, rng, tracker)
 
-    _save(model, args, args.steps, tokens_seen, opt, rng)
+    _save(model, args, args.steps, tokens_seen, opt, rng, tracker)
     log_f.write(f"DONE {_dt.datetime.now().isoformat()} tokens={tokens_seen}\n")
     log_f.close()
+    tracker.finish()
     print(f"[train_mtp] done. saved {os.path.join(args.out, 'mtp_heads.pt')}")
 
 
-def _save(model, args, step, tokens_seen, opt=None, rng=None):
+def _save(model, args, step, tokens_seen, opt=None, rng=None, tracker=None):
     path = os.path.join(args.out, "mtp_heads.pt")
     meta = {
         "step": step,
@@ -780,6 +807,12 @@ def _save(model, args, step, tokens_seen, opt=None, rng=None):
         }
         torch.save(trainer, os.path.join(args.out, "trainer_state.pt"))
     print(f"[train_mtp] saved {path} (step {step})")
+    # Only now -- after the checkpoint files are safely on disk -- do the
+    # buffered records go to trackio.  If this run is killed later, the trackio
+    # log still ends exactly at this checkpoint's step, so a restart from it
+    # continues the same run with nothing to clean up.
+    if tracker is not None:
+        tracker.flush()
 
 
 if __name__ == "__main__":

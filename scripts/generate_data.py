@@ -102,6 +102,7 @@ _THIS_DIR = _ROOT
 import mtp  # noqa: E402
 
 mtp._prepare_build_env()
+from trackio_helper import TrackioRun  # noqa: E402
 from torch.utils import cpp_extension as _cpp_ext  # noqa: E402
 
 # Capture the un-patched load BEFORE mtp wraps it: the v3a engine needs its own
@@ -792,7 +793,6 @@ class V3aRunner:
 
     def start_block(self, prompts):
         """Prefill len(prompts) prompts into the fixed batch state."""
-        t0 = time.time()
         B, state, x, path, graph, out = self._decode_ctx()
         m = self.model
         if self.deltalog and self._phase:
@@ -816,8 +816,6 @@ class V3aRunner:
             st1[0].zero_()
             st1[1].zero_()
             st1[2].zero_()
-        torch.cuda.synchronize()
-        self.last_prefill_s = time.time() - t0
 
     def decode(self, *, max_new, temperature, top_p, top_k, generator):
         """Batched lockstep decode from the prefilled state; returns per-row
@@ -837,10 +835,7 @@ class V3aRunner:
         gen_ids = [[] for _ in range(B)]
         done = [False] * B
         step = 0
-        t0 = time.time()
-        row_steps = 0  # rows still active x steps, to expose end-of-block waste
         while step < max_new:
-            row_steps += (B - sum(done)) * min(SYNC_EVERY, max_new - step)
             k = min(SYNC_EVERY, max_new - step)
             for j in range(k):
                 if graph is not None:
@@ -876,9 +871,6 @@ class V3aRunner:
             step += k
             if active == 0 or step >= max_new:
                 break
-        torch.cuda.synchronize()
-        self.last_decode_s = time.time() - t0
-        self.last_row_steps = row_steps
         return gen_ids
 
 
@@ -893,13 +885,6 @@ def _generate_block_v3a(runner, prompts, args, bidx):
     gen_ids = runner.decode(max_new=args.max_new, temperature=args.temperature,
                             top_p=args.top_p, top_k=args.top_k,
                             generator=gen)[:n]
-    pf = getattr(runner, "last_prefill_s", float("nan"))
-    dc = getattr(runner, "last_decode_s", float("nan"))
-    rs = getattr(runner, "last_row_steps", 0)
-    print(f"[gen] block {bidx} phases: prefill {pf:.2f}s, decode {dc:.2f}s "
-          f"(decode ran {rs} row-steps = "
-          f"{rs / (B_dec * args.max_new) * 100:.0f}% of full-batch capacity)",
-          flush=True)
     seqs = [np.asarray(p + g + [0], dtype=np.uint16)
             for p, g in zip(prompts, gen_ids)]
     arr = np.concatenate(seqs) if seqs else np.zeros(0, dtype=np.uint16)
@@ -983,7 +968,7 @@ def _gpu_worker(rank, device, cfg, args, block_q, res_q):
     _queue_finish(res_q)
 
 
-def _run_multi(args, cfg, tokenizer, devices):
+def _run_multi(args, cfg, tokenizer, devices, tracker: TrackioRun | None = None):
     n_workers = len(devices)
     n_blocks_expected = math.ceil(args.num_samples / args.batch)
 
@@ -1097,6 +1082,17 @@ def _run_multi(args, cfg, tokenizer, devices):
                           f"{n_tok / max(dt, 1e-6):.0f} tok/s | ETA {eta / 60:.1f} min",
                           flush=True)
                     last_log = now
+                    if tracker is not None:
+                        tracker.log_now({
+                            "blocks": blocks_done,
+                            "blocks_total": n_blocks_expected,
+                            "seqs": n_seq,
+                            "tokens": n_tok,
+                            "tok_s": n_tok / max(dt, 1e-6),
+                            "eta_min": eta / 60.0,
+                            **{f"blocks_{d.split(':')[-1]}": pd["blocks"]
+                               for d, pd in per_dev.items()},
+                        })
 
             alive = [p for p in procs if p.is_alive()]
             if prod["done"] and not alive and res_q.empty():
@@ -1139,13 +1135,21 @@ def _run_multi(args, cfg, tokenizer, devices):
     _write_meta(args, n_seq, n_tok, t0,
                 extra={"devices": devices, "per_device": per_dev,
                        "engine": args.engine})
+    if tracker is not None:
+        tracker.log_now({
+            "done": 1,
+            "seqs": n_seq,
+            "tokens": n_tok,
+            "minutes": (time.time() - t0) / 60.0,
+        })
+        tracker.finish()
 
 
 # ---------------------------------------------------------------------------
 # Single-GPU (original in-process behaviour, identical RNG stream)
 # ---------------------------------------------------------------------------
 
-def _run_single(args, cfg, tokenizer):
+def _run_single(args, cfg, tokenizer, tracker: TrackioRun | None = None):
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
 
     if args.engine == "v3a":
@@ -1168,10 +1172,18 @@ def _run_single(args, cfg, tokenizer):
                 dt = time.time() - t0
                 print(f"[gen] {n_seq} seqs, {n_tok:,} tokens, "
                       f"{n_tok / max(dt, 1e-6):.0f} tok/s, {dt / 60:.1f} min")
+                if tracker is not None:
+                    tracker.log_now({"seqs": n_seq, "tokens": n_tok,
+                                     "tok_s": n_tok / max(dt, 1e-6),
+                                     "minutes": dt / 60.0})
         arr = np.concatenate(buffer_out) if buffer_out else np.zeros(0, dtype=np.uint16)
         arr.tofile(args.out)
         _write_meta(args, n_seq, int(arr.size), t0,
                     extra={"devices": [args.device], "engine": "v3a"})
+        if tracker is not None:
+            tracker.log_now({"done": 1, "seqs": n_seq, "tokens": int(arr.size),
+                             "minutes": (time.time() - t0) / 60.0})
+            tracker.finish()
         return
 
     print(f"[gen] loading model {args.pth} (L{cfg['num_hidden_layers']} "
@@ -1194,9 +1206,17 @@ def _run_single(args, cfg, tokenizer):
             dt = time.time() - t0
             print(f"[gen] {n_seq} seqs, {n_tok:,} tokens, "
                   f"{n_tok / max(dt, 1e-6):.0f} tok/s, {dt / 60:.1f} min")
+            if tracker is not None:
+                tracker.log_now({"seqs": n_seq, "tokens": n_tok,
+                                 "tok_s": n_tok / max(dt, 1e-6),
+                                 "minutes": dt / 60.0})
     arr = np.concatenate(buffer_out) if buffer_out else np.zeros(0, dtype=np.uint16)
     arr.tofile(args.out)
     _write_meta(args, n_seq, int(arr.size), t0, extra={"devices": [args.device]})
+    if tracker is not None:
+        tracker.log_now({"done": 1, "seqs": n_seq, "tokens": int(arr.size),
+                         "minutes": (time.time() - t0) / 60.0})
+        tracker.finish()
 
 
 def _write_meta(args, n_seq, n_tok, t0, extra):
@@ -1293,6 +1313,13 @@ def main():
                          "'cuda:0,cuda:1'")
     ap.add_argument("--log-every", type=int, default=1,
                     help="log every N batches (single-GPU) / blocks (multi-GPU)")
+    ap.add_argument("--trackio-project", default="",
+                    help="trackio project name (LOCAL logging only; view with "
+                         "'trackio show --project <name>'); empty (default) "
+                         "disables trackio logging entirely")
+    ap.add_argument("--trackio-run", default="",
+                    help="trackio run name (default: the --out file stem; "
+                         "re-running with the same name resumes the same run)")
     ap.add_argument("--smoke", action="store_true",
                     help="generate from one fixed prompt and print it, then exit")
     args = ap.parse_args()
@@ -1324,10 +1351,21 @@ def main():
         return
 
     devices = _resolve_devices(args)
+    # trackio (optional): initialized ONLY in the main process -- the spawned
+    # GPU workers never touch it.  Data generation has no checkpoints, so
+    # records are logged directly as progress happens (no buffering).
+    tracker = None
+    if args.trackio_project:
+        tracker = TrackioRun(
+            args.trackio_project,
+            name=args.trackio_run or os.path.splitext(os.path.basename(args.out))[0],
+            config=dict(vars(args)),
+            tag="gen",
+        )
     if len(devices) <= 1:
-        _run_single(args, cfg, tokenizer)
+        _run_single(args, cfg, tokenizer, tracker)
     else:
-        _run_multi(args, cfg, tokenizer, devices)
+        _run_multi(args, cfg, tokenizer, devices, tracker)
 
 
 if __name__ == "__main__":

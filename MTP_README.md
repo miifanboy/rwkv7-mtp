@@ -283,6 +283,50 @@ the field is omitted from the log line rather than printed as 0.0000.
 It is worth keeping **on** for a first run: `main` is how you notice that the
 self-distilled corpus has drifted out of the backbone's distribution.
 
+## Experiment tracking (trackio)
+
+`train_mtp.py` can mirror its `metrics.jsonl` records into
+[trackio](https://github.com/gradio-app/trackio). Logging is **local only**
+(stored under `~/.cache/huggingface/trackio`) — no Hugging Face Space is
+created or needed:
+
+```bash
+python scripts/train_mtp.py ... --trackio-project rwkv-mtp
+
+# view the dashboard:
+trackio show --project rwkv-mtp
+```
+
+`generate_data.py` supports the same `--trackio-project` / `--trackio-run`
+flags and logs generation throughput (blocks/seqs/tokens/tok-s/ETA) directly
+as it goes.
+
+* `--trackio-run` overrides the run name; by default it is the `--out`
+  directory basename, so restarting from a checkpoint (same `--out`) resumes
+  the same trackio run.
+* **Restart-safe by construction**: records are buffered in memory and only
+  sent to trackio right AFTER a checkpoint is written.  If the run dies at
+  step 750 with a checkpoint from step 500, steps 500-749 were buffered and
+  never reached trackio -- the log ends exactly at the checkpoint, so the
+  restarted run continues it with nothing to clean up.  (This is why trackio
+  metrics lag the console by up to `--save-every` steps; the live numbers stay
+  in `train_log.txt` / `metrics.jsonl`.)
+* Steps are logged with explicit step numbers, so resumed runs continue the
+  x-axis at the checkpoint step.
+
+If a remote dashboard is ever wanted, publish the local project to a free
+**static** Space (read-only snapshot; re-run the sync to refresh) — this avoids
+the PRO subscription that HF requires for hosting Gradio Spaces, and the HF
+Bucket that trackio's live remote mode uses:
+
+```bash
+python -c "import trackio; trackio.sync(
+    project='rwkv-mtp',
+    space_id='yourname/rwkv-trackio',
+    sdk='static',
+    dataset_id='yourname/rwkv-trackio-data')"
+```
+
 ## LK losses (`--mtp-loss lk-hybrid` / `--mtp-loss lk-alpha`)
 
 See `docs/lk-loss.md` for the mathematics. The depth loss is replaced by an objective

@@ -4,7 +4,7 @@
 *.gguf
 
 # training data + self-generated data
-data/
+data*/
 data-ob/
 data-ob-1.5b/
 
