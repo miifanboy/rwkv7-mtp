@@ -1,0 +1,23 @@
+# --- generated / large local artifacts --------------------------------------
+# model weights
+*.pth
+*.gguf
+
+# training data + self-generated data
+data/
+data-ob/
+data-ob-1.5b/
+
+# MTP training runs
+mtp_out*/
+
+# model configs (local, machine-specific)
+config*.json
+
+# --- caches / environment ----------------------------------------------------
+__pycache__/
+*.pyc
+.hf_home/
+.venv/
+.venv-backups/
+*.log

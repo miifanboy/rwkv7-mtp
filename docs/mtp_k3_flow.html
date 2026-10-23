@@ -1,0 +1,675 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RWKV-7 shared MTP head, K=3 — flowcharts</title>
+<style>
+  :root{
+    --bg:#0b0f14; --panel:#10161d; --line:#22303c; --tx:#d7dde6; --mut:#8b98a5;
+    --frozen:#58a6ff; --train:#3fb950; --data:#d29922; --logit:#bc8cff; --tent:#f0883e; --red:#f85149;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.55 system-ui,"Segoe UI",sans-serif}
+  .wrap{max-width:1300px;margin:0 auto;padding:18px 18px 40px}
+  h1{font-size:21px;margin:8px 0 2px}
+  .sub{color:var(--mut);font-size:13px}
+  .legend{display:flex;flex-wrap:wrap;gap:14px;margin:12px 0 4px;font-size:12.5px;color:var(--mut)}
+  .legend b{display:inline-block;width:12px;height:12px;border-radius:3px;margin-right:5px;vertical-align:-1px}
+  .tabs{display:flex;gap:8px;margin:14px 0}
+  .tabs button{background:var(--panel);color:var(--tx);border:1px solid var(--line);border-radius:8px;
+    padding:8px 14px;cursor:pointer;font-size:14px}
+  .tabs button.on{border-color:var(--frozen);color:#fff;background:#16202b}
+  .tab{display:none}.tab.active{display:block}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px;margin-top:12px}
+  svg{width:100%;height:auto;display:block}
+  svg text{font-family:ui-monospace,Consolas,"Cascadia Mono",monospace;fill:var(--tx)}
+  svg .h{font-size:13.5px;font-weight:600}
+  svg .s{font-size:11px;fill:var(--mut)}
+  svg .tiny{font-size:10px;fill:var(--mut)}
+  .frozen{fill:#13202f;stroke:var(--frozen)}
+  .train {fill:#0f2417;stroke:var(--train)}
+  .data  {fill:#262009;stroke:var(--data)}
+  .neut  {fill:#151d26;stroke:#4a5d72}
+  .logit {fill:#221733;stroke:var(--logit)}
+  .exact {fill:#0f2417;stroke:var(--train)}
+  .tent  {fill:#251507;stroke:var(--tent);stroke-dasharray:6 4}
+  .bad   {fill:#25100e;stroke:var(--red)}
+  .flow{stroke:#5b6b7d;fill:none;stroke-width:1.6;marker-end:url(#ah1)}
+  .flowd{stroke:var(--tent);fill:none;stroke-width:1.5;stroke-dasharray:5 4;marker-end:url(#ah2)}
+  .flowg{stroke:var(--train);fill:none;stroke-width:1.5;marker-end:url(#ah3)}
+  .flowp{stroke:var(--logit);fill:none;stroke-width:1.4;stroke-dasharray:4 4;marker-end:url(#ah4)}
+  .stg{transition:opacity .25s}
+  #svginfer .dim{opacity:.13}
+  #svginfer .now rect,#svginfer .now path,#svginfer .now circle{stroke-width:2.6}
+  .stepnum{fill:#0b0f14;stroke:#5b6b7d}
+  .stepnum text{font-size:10px;fill:var(--mut)}
+  /* stepper */
+  .controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+  .controls button{background:#16202b;color:var(--tx);border:1px solid var(--line);border-radius:8px;
+    padding:7px 14px;cursor:pointer;font-size:13.5px}
+  .controls button:disabled{opacity:.4;cursor:default}
+  .controls .cnt{color:var(--mut);font-size:13px;min-width:64px;text-align:center}
+  .stepbox{border-top:1px solid var(--line);margin-top:10px;padding-top:10px}
+  .steptag{display:inline-block;font-size:11px;letter-spacing:.6px;border:1px solid var(--tent);
+    color:var(--tent);border-radius:20px;padding:1px 10px;margin-bottom:6px}
+  .steptitle{font-weight:600;font-size:15px}
+  .steptxt{color:var(--tx);font-size:13.5px;margin-top:4px;max-width:110ch}
+  table{border-collapse:collapse;margin-top:10px;font-size:13.5px}
+  th,td{border:1px solid var(--line);padding:6px 12px;text-align:left}
+  th{background:#16202b;color:#fff;font-weight:600}
+  td code{color:var(--data)}
+  .note{color:var(--mut);font-size:13px;margin-top:10px}
+  .chip{display:inline-block;border:1px solid var(--line);border-radius:6px;padding:2px 8px;margin:2px 4px 2px 0;font-size:12.5px}
+  footer{margin-top:22px;color:var(--mut);font-size:12.5px}
+  footer code{color:var(--tx)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>RWKV-7 shared MTP head — how it works at K=3</h1>
+<div class="sub">One RWKV-7 block (~94M trainable params) reused recursively for 3 draft depths ·
+backbone frozen · matches <code>train_temp/mtp.py</code> and <code>train_temp/spec_decode.py</code></div>
+
+<div class="legend">
+  <span><b style="background:#13202f;border:1px solid var(--frozen)"></b>frozen (backbone / emb / W<sub>out</sub>)</span>
+  <span><b style="background:#0f2417;border:1px solid var(--train)"></b>trainable head</span>
+  <span><b style="background:#262009;border:1px solid var(--data)"></b>tokens / embeddings</span>
+  <span><b style="background:#221733;border:1px solid var(--logit)"></b>CE / logits / pick</span>
+  <span><b style="background:#0f2417;border:1px solid var(--train)"></b>exact ingestion (committed inputs)</span>
+  <span><b style="background:#251507;border:1px dashed var(--tent)"></b>tentative (depends on unverified draft)</span>
+</div>
+
+<div class="tabs">
+  <button class="on" data-tab="tab-anatomy">1 · Inside the shared head</button>
+  <button data-tab="tab-train">2 · Training (teacher-forced, parallel)</button>
+  <button data-tab="tab-infer">3 · Inference (draft → verify, step-through)</button>
+</div>
+
+<!-- ============================================================= TAB 1 -->
+<section id="tab-anatomy" class="tab active">
+  <div class="panel">
+    <div class="sub" style="margin-bottom:6px">
+      <code>RWKV7MTPModule.forward(h, tok_emb)</code> — the <b>same</b> module and weights are applied at
+      every depth k = 0, 1, 2. Nothing here knows about depths; recursion lives in how it is <i>called</i>.
+    </div>
+    <svg viewBox="0 0 960 705" role="img" aria-label="Shared head anatomy">
+      <defs>
+        <marker id="ah1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0,0 L10,5 L0,10 z" fill="#5b6b7d"/></marker>
+        <marker id="ah2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0,0 L10,5 L0,10 z" fill="#f0883e"/></marker>
+        <marker id="ah3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0,0 L10,5 L0,10 z" fill="#3fb950"/></marker>
+        <marker id="ah4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0,0 L10,5 L0,10 z" fill="#bc8cff"/></marker>
+      </defs>
+      <rect class="frozen" x="60" y="40" width="320" height="60" rx="10"/>
+      <text class="h" x="220" y="65" text-anchor="middle">h_prev  (B,T,C)</text>
+      <text class="s" x="220" y="84" text-anchor="middle">backbone hidden h_i (k=0) or z_(k-1,i) (k≥1)</text>
+      <rect class="data" x="580" y="40" width="320" height="60" rx="10"/>
+      <text class="h" x="740" y="65" text-anchor="middle">tok_emb  (B,T,C)</text>
+      <text class="s" x="740" y="84" text-anchor="middle">= emb( x[i+k+1] )  — frozen table</text>
+
+      <path class="flow" d="M220,100 L220,150"/>
+      <path class="flow" d="M740,100 L740,150"/>
+      <rect class="train" x="140" y="150" width="160" height="46" rx="10"/>
+      <text class="h" x="220" y="178" text-anchor="middle">ln_h</text>
+      <rect class="train" x="660" y="150" width="160" height="46" rx="10"/>
+      <text class="h" x="740" y="178" text-anchor="middle">ln_tok</text>
+
+      <path class="flow" d="M220,196 L390,240"/>
+      <path class="flow" d="M740,196 L570,240"/>
+      <rect class="neut" x="320" y="240" width="320" height="50" rx="10"/>
+      <text class="h" x="480" y="270" text-anchor="middle">concat → 2C</text>
+
+      <path class="flow" d="M480,290 L480,330"/>
+      <rect class="train" x="330" y="330" width="300" height="50" rx="10"/>
+      <text class="h" x="480" y="352" text-anchor="middle">proj : Linear(2C → C)</text>
+      <text class="s" x="480" y="370" text-anchor="middle">no bias · trainable</text>
+
+      <path class="flow" d="M480,380 L480,420"/>
+      <rect class="train" x="260" y="420" width="440" height="110" rx="10"/>
+      <text class="h" x="480" y="446" text-anchor="middle">RWKV-7 block  (one Block, layer-id 0)</text>
+      <text class="s" x="480" y="468" text-anchor="middle">tmix: token-shift + WKV₇ (r,k,v,w,a,g gates) — carries its own RNN state</text>
+      <text class="s" x="480" y="488" text-anchor="middle">ffn: 4C, squared-ReLU  ·  residual adds  ·  layer norms</text>
+      <text class="tiny" x="480" y="512" text-anchor="middle">this recurrent state is why the head "remembers" the draft chain at inference</text>
+
+      <rect class="neut" x="730" y="428" width="205" height="96" rx="10" stroke-dasharray="4 4"/>
+      <text class="tiny" x="832" y="452" text-anchor="middle">layer-0 semantics:</text>
+      <text class="tiny" x="832" y="468" text-anchor="middle">v_first = its own value →</text>
+      <text class="tiny" x="832" y="484" text-anchor="middle">no external value-residual;</text>
+      <text class="tiny" x="832" y="500" text-anchor="middle">att.v0/v1/v2 aliased onto</text>
+      <text class="tiny" x="832" y="516" text-anchor="middle">the a-pathway (no dead slots)</text>
+
+      <path class="flow" d="M480,530 L480,565"/>
+      <rect class="neut" x="380" y="565" width="200" height="46" rx="10"/>
+      <text class="h" x="480" y="593" text-anchor="middle">z  (B,T,C)</text>
+
+      <path class="flow" d="M480,611 L480,640"/>
+      <rect class="frozen" x="330" y="640" width="300" height="50" rx="10"/>
+      <text class="h" x="480" y="662" text-anchor="middle">× W_out (frozen) → logits</text>
+      <text class="s" x="480" y="680" text-anchor="middle">same output head as the backbone · z·W_out</text>
+    </svg>
+    <div class="note">
+      <span class="chip">~94M trainable: ln_h + ln_tok + proj + one RWKV-7 block (C=2560)</span>
+      <span class="chip">backbone (2.9B), emb, W_out all frozen</span>
+      <span class="chip">at inference one WKV state per depth k is kept (stateless MLP head this is not)</span>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================= TAB 2 -->
+<section id="tab-train" class="tab">
+  <div class="panel">
+    <div class="sub" style="margin-bottom:6px">
+      <code>RWKVWithMTP.forward_loss(idx, targets)</code> — every position i of the (B,T) chunk is computed
+      <b>in parallel</b>; depth-k inputs are <b>ground-truth tokens</b> (teacher forcing), never the head's own
+      output. This parallel form reproduces exactly the recursive computation used at inference.
+    </div>
+    <svg viewBox="0 0 1240 700" role="img" aria-label="Training flowchart">
+      <defs>
+        <marker id="ah1b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0,0 L10,5 L0,10 z" fill="#5b6b7d"/></marker>
+        <marker id="ah4b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0,0 L10,5 L0,10 z" fill="#bc8cff"/></marker>
+      </defs>
+
+      <!-- top row -->
+      <rect class="data"  x="30" y="30" width="200" height="52" rx="10"/>
+      <text class="h" x="130" y="52" text-anchor="middle">x chunk (B,T)</text>
+      <text class="s" x="130" y="70" text-anchor="middle">self-gen tokens (uint16)</text>
+      <path class="flow" d="M230,56 L300,56"/>
+      <rect class="frozen" x="300" y="30" width="250" height="52" rx="10"/>
+      <text class="h" x="425" y="52" text-anchor="middle">frozen backbone</text>
+      <text class="s" x="425" y="70" text-anchor="middle">no_grad · 2.9B · bf16 kernels</text>
+      <path class="flow" d="M550,56 L615,56"/>
+      <rect class="neut" x="615" y="30" width="190" height="52" rx="10"/>
+      <text class="h" x="710" y="61" text-anchor="middle">h_i (B,T,C)</text>
+
+      <path class="flow" d="M805,50 L895,46"/>
+      <rect class="frozen" x="895" y="20" width="320" height="52" rx="10"/>
+      <text class="h" x="1055" y="42" text-anchor="middle">main CE (monitor)</text>
+      <text class="s" x="1055" y="60" text-anchor="middle">h_i·W_out vs x[i+1] · zero grad · ~3.5% of step</text>
+      <path class="flow" d="M805,70 L895,120"/>
+      <rect class="frozen" x="895" y="96" width="320" height="48" rx="10"/>
+      <text class="h" x="1055" y="116" text-anchor="middle">teacher top-64 table</text>
+      <text class="s" x="1055" y="134" text-anchor="middle">backbone logits at every position — once per micro-step</text>
+
+      <!-- emb table -->
+      <rect class="frozen" x="30" y="365" width="150" height="44" rx="10"/>
+      <text class="h" x="105" y="385" text-anchor="middle">emb</text>
+      <text class="s" x="105" y="401" text-anchor="middle">(frozen)</text>
+
+      <!-- h -> src0 elbow -->
+      <path class="flow" d="M710,82 L710,130 L295,130 L295,210"/>
+
+      <!-- ===== depth rows ===== -->
+      <!-- row k=0 (y0=210) -->
+      <text class="s" x="450" y="202">k=0 — predicts 2 ahead</text>
+      <rect class="frozen" x="210" y="210" width="170" height="50" rx="10"/>
+      <text class="h" x="295" y="232" text-anchor="middle">h_i</text>
+      <text class="s" x="295" y="250" text-anchor="middle">backbone hidden</text>
+      <rect class="data" x="210" y="274" width="170" height="40" rx="10"/>
+      <text class="s" x="295" y="298" text-anchor="middle">emb( x[i+1] )</text>
+      <rect class="train" x="450" y="212" width="240" height="76" rx="10"/>
+      <text class="h" x="570" y="240" text-anchor="middle">SHARED HEAD ×1</text>
+      <text class="s" x="570" y="258" text-anchor="middle">fuse + RWKV-7 block</text>
+      <text class="tiny" x="570" y="276" text-anchor="middle">same weights at k=0,1,2</text>
+      <rect class="neut" x="740" y="228" width="110" height="44" rx="10"/>
+      <text class="h" x="795" y="255" text-anchor="middle">z₀_i</text>
+      <rect class="logit" x="900" y="214" width="300" height="76" rx="10"/>
+      <text class="h" x="1050" y="236" text-anchor="middle">CE₀ vs x[i+2]</text>
+      <text class="s" x="1050" y="256" text-anchor="middle">rows T-(k+2) · w = 0.8¹ = 0.8</text>
+      <text class="s" x="1050" y="276" text-anchor="middle">+ λ·KL( teacher @ i+1 )</text>
+      <path class="flow" d="M380,235 L450,240"/>
+      <path class="flow" d="M380,294 L450,262"/>
+      <path class="flow" d="M180,387 L210,294"/>
+      <path class="flow" d="M690,250 L740,250"/>
+      <path class="flow" d="M850,250 L900,252"/>
+      <path class="flowp" d="M1215,120 L1225,120 L1225,252 L1200,252"/>
+
+      <!-- row k=1 (y0=335) -->
+      <text class="s" x="450" y="327">k=1 — predicts 3 ahead</text>
+      <rect class="neut" x="210" y="335" width="170" height="50" rx="10"/>
+      <text class="h" x="295" y="357" text-anchor="middle">z₀_i</text>
+      <text class="s" x="295" y="375" text-anchor="middle">depth-0 output</text>
+      <rect class="data" x="210" y="399" width="170" height="40" rx="10"/>
+      <text class="s" x="295" y="423" text-anchor="middle">emb( x[i+2] )</text>
+      <rect class="train" x="450" y="337" width="240" height="76" rx="10"/>
+      <text class="h" x="570" y="365" text-anchor="middle">SHARED HEAD ×1</text>
+      <text class="s" x="570" y="383" text-anchor="middle">fuse + RWKV-7 block</text>
+      <text class="tiny" x="570" y="401" text-anchor="middle">same weights</text>
+      <rect class="neut" x="740" y="353" width="110" height="44" rx="10"/>
+      <text class="h" x="795" y="380" text-anchor="middle">z₁_i</text>
+      <rect class="logit" x="900" y="339" width="300" height="76" rx="10"/>
+      <text class="h" x="1050" y="361" text-anchor="middle">CE₁ vs x[i+3]</text>
+      <text class="s" x="1050" y="381" text-anchor="middle">rows T-(k+2) · w = 0.8² = 0.64</text>
+      <text class="s" x="1050" y="401" text-anchor="middle">+ λ·KL( teacher @ i+2 )</text>
+      <path class="flow" d="M380,360 L450,365"/>
+      <path class="flow" d="M380,419 L450,387"/>
+      <path class="flow" d="M180,387 L210,419"/>
+      <path class="flow" d="M690,375 L740,375"/>
+      <path class="flow" d="M850,375 L900,377"/>
+      <path class="flowp" d="M1225,252 L1225,377 L1200,377"/>
+      <!-- z0 -> src1 elbow -->
+      <path class="flow" d="M795,272 L795,318 L295,318 L295,335"/>
+
+      <!-- row k=2 (y0=460) -->
+      <text class="s" x="450" y="452">k=2 — predicts 4 ahead</text>
+      <rect class="neut" x="210" y="460" width="170" height="50" rx="10"/>
+      <text class="h" x="295" y="482" text-anchor="middle">z₁_i</text>
+      <text class="s" x="295" y="500" text-anchor="middle">depth-1 output</text>
+      <rect class="data" x="210" y="524" width="170" height="40" rx="10"/>
+      <text class="s" x="295" y="548" text-anchor="middle">emb( x[i+3] )</text>
+      <rect class="train" x="450" y="462" width="240" height="76" rx="10"/>
+      <text class="h" x="570" y="490" text-anchor="middle">SHARED HEAD ×1</text>
+      <text class="s" x="570" y="508" text-anchor="middle">fuse + RWKV-7 block</text>
+      <text class="tiny" x="570" y="526" text-anchor="middle">same weights</text>
+      <rect class="neut" x="740" y="478" width="110" height="44" rx="10"/>
+      <text class="h" x="795" y="505" text-anchor="middle">z₂_i</text>
+      <rect class="logit" x="900" y="464" width="300" height="76" rx="10"/>
+      <text class="h" x="1050" y="486" text-anchor="middle">CE₂ vs x[i+4]</text>
+      <text class="s" x="1050" y="506" text-anchor="middle">rows T-(k+2) · w = 0.8³ = 0.512</text>
+      <text class="s" x="1050" y="526" text-anchor="middle">+ λ·KL( teacher @ i+3 )</text>
+      <path class="flow" d="M380,485 L450,490"/>
+      <path class="flow" d="M380,544 L450,512"/>
+      <path class="flow" d="M180,387 L210,544"/>
+      <path class="flow" d="M690,500 L740,500"/>
+      <path class="flow" d="M850,500 L900,502"/>
+      <path class="flowp" d="M1225,377 L1225,502 L1200,502"/>
+      <!-- z1 -> src2 elbow -->
+      <path class="flow" d="M795,397 L795,443 L295,443 L295,460"/>
+
+      <!-- collect to total -->
+      <path class="flow" d="M905,290 L875,290 L875,585"/>
+      <path class="flow" d="M905,415 L875,415"/>
+      <path class="flow" d="M905,540 L875,540 L875,552"/>
+      <path class="flow" d="M1050,540 L1050,560"/>
+      <rect class="logit" x="760" y="560" width="460" height="56" rx="10"/>
+      <text class="h" x="990" y="583" text-anchor="middle">total = (CE_main + 0.8·CE₀ + 0.64·CE₁ + 0.512·CE₂) / 2.952</text>
+      <text class="s" x="990" y="603" text-anchor="middle">weights: main 1 · depths 0.8^(k+1) · normalised by total_w</text>
+      <path class="flow" d="M990,616 L990,640"/>
+      <rect class="train" x="760" y="640" width="460" height="48" rx="10"/>
+      <text class="h" x="990" y="660" text-anchor="middle">backward → gradients only into the head (~94M)</text>
+      <text class="s" x="990" y="678" text-anchor="middle">fused CE recomputes W_out·z in bwd — no (B,T,V) tensor kept</text>
+    </svg>
+
+    <table>
+      <tr><th>signal</th><th>input(s) at row i</th><th>predicts</th><th>loss weight</th></tr>
+      <tr><td>main (frozen monitor)</td><td>h_i</td><td><code>x[i+1]</code></td><td>1 (zero grad)</td></tr>
+      <tr><td>depth 0</td><td>h_i + emb(x[i+1])</td><td><code>x[i+2]</code></td><td>0.8</td></tr>
+      <tr><td>depth 1</td><td>z₀_i + emb(x[i+2])</td><td><code>x[i+3]</code></td><td>0.64</td></tr>
+      <tr><td>depth 2</td><td>z₁_i + emb(x[i+3])</td><td><code>x[i+4]</code></td><td>0.512</td></tr>
+    </table>
+    <div class="note">
+      The teacher for depth k at row i is the <b>frozen backbone's own distribution at position i+k+1</b>
+      (the position whose next token is exactly x[i+k+2], the depth-k target) — restricted to its top-64
+      tokens, renormalised (<code>--distill-topk 64 --distill-lambda 0.5</code>). Because embeddings and
+      W_out are frozen, gradients exist only for ln_h/ln_tok/proj/block — your 94M.
+      Causality: depth-k's injected token at row i is x[i+k+1], and its state summarizes rows j ≤ i —
+      nothing from beyond the target is ever consumed.
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================= TAB 3 -->
+<section id="tab-infer" class="tab">
+  <div class="panel">
+    <div class="sub" style="margin-bottom:8px">
+      One draft/verify round at stream end p (<code>RWKV7HeadRunner.draft_chain</code> + the
+      <code>generate</code> loop in <code>spec_decode.py</code>). K=3 → <b>4 drafts</b>: the backbone's own
+      next token d₀ (always accepted — it IS the backbone's output) plus 3 recursive head drafts.
+      Between <b>2 and 5 tokens</b> are committed per round. Click through the steps:
+    </div>
+    <div class="controls">
+      <button id="btnPrev">◀ prev</button>
+      <button id="btnNext">next ▶</button>
+      <button id="btnPlay">▶ play</button>
+      <button id="btnFull">show full diagram</button>
+      <span class="cnt" id="stepCnt">1 / 15</span>
+    </div>
+    <svg id="svginfer" viewBox="0 0 1240 880" role="img" aria-label="Inference draft chain">
+      <defs>
+        <marker id="ah1c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0,0 L10,5 L0,10 z" fill="#5b6b7d"/></marker>
+        <marker id="ah2c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0,0 L10,5 L0,10 z" fill="#f0883e"/></marker>
+        <marker id="ah3c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0,0 L10,5 L0,10 z" fill="#3fb950"/></marker>
+        <marker id="ah4c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0,0 L10,5 L0,10 z" fill="#bc8cff"/></marker>
+      </defs>
+
+      <!-- ===== token stream strip ===== -->
+      <g class="stg" id="i-stream">
+        <text class="tiny" x="62"  y="20" text-anchor="middle">p−3</text>
+        <text class="tiny" x="134" y="20" text-anchor="middle">p−2</text>
+        <text class="tiny" x="206" y="20" text-anchor="middle">p−1</text>
+        <text class="tiny" x="278" y="20" text-anchor="middle">p</text>
+        <text class="tiny" x="384" y="20" text-anchor="middle">p+1</text>
+        <text class="tiny" x="456" y="20" text-anchor="middle">p+2</text>
+        <text class="tiny" x="528" y="20" text-anchor="middle">p+3</text>
+        <text class="tiny" x="600" y="20" text-anchor="middle">p+4</text>
+        <rect class="frozen" x="30"  y="30" width="64" height="44" rx="8"/>
+        <text class="h" x="62"  y="57" text-anchor="middle">cₚ₋₃</text>
+        <rect class="frozen" x="102" y="30" width="64" height="44" rx="8"/>
+        <text class="h" x="134" y="57" text-anchor="middle">cₚ₋₂</text>
+        <rect class="frozen" x="174" y="30" width="64" height="44" rx="8"/>
+        <text class="h" x="206" y="57" text-anchor="middle">cₚ₋₁</text>
+        <rect class="frozen" x="246" y="30" width="64" height="44" rx="8"/>
+        <text class="h" x="278" y="57" text-anchor="middle">cₚ</text>
+        <path d="M330,24 L330,82" stroke="#4a5d72" stroke-width="2"/>
+        <text class="tiny" x="330" y="98" text-anchor="middle">committed ↑</text>
+        <rect class="exact" x="352" y="30" width="64" height="44" rx="8" id="i-d0"/>
+        <text class="h" x="384" y="57" text-anchor="middle">d₀</text>
+        <rect class="tent" x="424" y="30" width="64" height="44" rx="8" id="i-d1"/>
+        <text class="h" x="456" y="57" text-anchor="middle">d₁</text>
+        <rect class="tent" x="496" y="30" width="64" height="44" rx="8" id="i-d2"/>
+        <text class="h" x="528" y="57" text-anchor="middle">d₂</text>
+        <rect class="tent" x="568" y="30" width="64" height="44" rx="8" id="i-d3"/>
+        <text class="h" x="600" y="57" text-anchor="middle">d₃</text>
+        <text class="tiny" x="384" y="94" text-anchor="middle">cₚ₊₁</text>
+        <text class="tiny" x="456" y="94" text-anchor="middle">cₚ₊₂</text>
+        <text class="tiny" x="528" y="94" text-anchor="middle">cₚ₊₃</text>
+        <text class="tiny" x="600" y="94" text-anchor="middle">cₚ₊₄</text>
+        <text class="tiny" x="700" y="118">drafted → verified before commit</text>
+      </g>
+
+      <!-- ===== row A ===== -->
+      <g class="stg" id="i-snap">
+        <rect class="neut" x="30" y="150" width="150" height="56" rx="10"/>
+        <text class="h" x="105" y="172" text-anchor="middle">SNAPSHOT</text>
+        <text class="s" x="105" y="190" text-anchor="middle">clone WKV states S₀,S₁,S₂</text>
+        <text class="s" x="105" y="203" text-anchor="middle">+ z-buffers (rollback point)</text>
+        <circle class="stepnum" cx="42" cy="162" r="9"/><text x="42" y="166" text-anchor="middle">1</text>
+      </g>
+      <g class="stg" id="i-hp">
+        <rect class="frozen" x="240" y="150" width="130" height="56" rx="10"/>
+        <text class="h" x="305" y="172" text-anchor="middle">h_p</text>
+        <text class="s" x="305" y="190" text-anchor="middle">backbone hidden</text>
+        <text class="s" x="305" y="203" text-anchor="middle">at stream end p</text>
+        <circle class="stepnum" cx="252" cy="162" r="9"/><text x="252" y="166" text-anchor="middle">2</text>
+      </g>
+      <g class="stg" id="i-pickd0">
+        <rect class="logit" x="430" y="150" width="120" height="56" rx="10"/>
+        <text class="h" x="490" y="172" text-anchor="middle">pick d₀</text>
+        <text class="s" x="490" y="190" text-anchor="middle">h_p·W_out →</text>
+        <text class="s" x="490" y="203" text-anchor="middle">argmax/sample</text>
+        <circle class="stepnum" cx="442" cy="162" r="9"/><text x="442" y="166" text-anchor="middle">2</text>
+      </g>
+      <path class="stg flow" id="i-pickd0-arrow" d="M490,150 L490,112 L384,112 L384,78"/>
+      <g class="stg" id="i-D0p">
+        <rect class="exact" x="610" y="150" width="290" height="56" rx="10"/>
+        <text class="h" x="755" y="172" text-anchor="middle">D0 @ j=p :  fuse(h_p, emb(d₀))</text>
+        <text class="s" x="755" y="190" text-anchor="middle">→ z₀[p]   EXACT (both inputs committed)</text>
+        <text class="tiny" x="755" y="203" text-anchor="middle">x₀[p] = proj([ln_h(h_p) ; ln_tok(emb(cₚ₊₁))])</text>
+        <circle class="stepnum" cx="622" cy="162" r="9"/><text x="622" y="166" text-anchor="middle">3</text>
+      </g>
+      <g class="stg" id="i-pickd1">
+        <rect class="logit" x="960" y="150" width="130" height="56" rx="10"/>
+        <text class="h" x="1025" y="172" text-anchor="middle">pick d₁</text>
+        <text class="s" x="1025" y="190" text-anchor="middle">z₀[p]·W_out → cₚ₊₂</text>
+        <text class="s" x="1025" y="203" text-anchor="middle">TENTATIVE</text>
+        <circle class="stepnum" cx="972" cy="162" r="9"/><text x="972" y="166" text-anchor="middle">4</text>
+      </g>
+      <path class="stg flow" id="i-pickd1-arrow" d="M1025,150 L1025,108 L456,108 L456,78"/>
+
+      <!-- ===== row B ===== -->
+      <g class="stg" id="i-D1cu">
+        <rect class="exact" x="30" y="280" width="300" height="56" rx="10"/>
+        <text class="h" x="180" y="302" text-anchor="middle">D1 catch-up @ j=p−1</text>
+        <text class="s" x="180" y="320" text-anchor="middle">fuse( zbuffer₀[p−1] , emb(cₚ₊₁) ) → z₁[p−1]</text>
+        <text class="s" x="180" y="333" text-anchor="middle">EXACT — token committed, z buffered (watermark)</text>
+        <circle class="stepnum" cx="42" cy="292" r="9"/><text x="42" y="296" text-anchor="middle">5</text>
+      </g>
+      <g class="stg" id="i-D1p">
+        <rect class="tent" x="390" y="280" width="300" height="56" rx="10"/>
+        <text class="h" x="540" y="302" text-anchor="middle">D1 @ j=p :  fuse(z₀[p], emb(d₁))</text>
+        <text class="s" x="540" y="320" text-anchor="middle">→ z₁[p]   TENTATIVE (d₁ unverified)</text>
+        <text class="tiny" x="540" y="333" text-anchor="middle">z₀[p] comes from this chain (step 3)</text>
+        <circle class="stepnum" cx="402" cy="292" r="9"/><text x="402" y="296" text-anchor="middle">6</text>
+      </g>
+      <g class="stg" id="i-pickd2">
+        <rect class="logit" x="750" y="280" width="130" height="56" rx="10"/>
+        <text class="h" x="815" y="302" text-anchor="middle">pick d₂</text>
+        <text class="s" x="815" y="320" text-anchor="middle">z₁[p]·W_out → cₚ₊₃</text>
+        <text class="s" x="815" y="333" text-anchor="middle">TENTATIVE</text>
+        <circle class="stepnum" cx="762" cy="292" r="9"/><text x="762" y="296" text-anchor="middle">7</text>
+      </g>
+      <path class="stg flow" id="i-wrapB" d="M1025,206 L1025,243 L180,243 L180,278"/>
+      <path class="stg flowd" id="i-d1feed" d="M426,74 L426,278"/>
+      <path class="stg flowg" id="i-d0feed" d="M366,74 L366,130 L640,130 L640,146"/>
+
+      <!-- ===== row C ===== -->
+      <g class="stg" id="i-D2cu">
+        <rect class="exact" x="30" y="410" width="270" height="56" rx="10"/>
+        <text class="h" x="165" y="432" text-anchor="middle">D2 catch-up @ j=p−2</text>
+        <text class="s" x="165" y="450" text-anchor="middle">fuse( zbuffer₁[p−2] , emb(cₚ₊₁) )</text>
+        <text class="s" x="165" y="463" text-anchor="middle">EXACT — like step 5, one depth deeper</text>
+        <circle class="stepnum" cx="42" cy="422" r="9"/><text x="42" y="426" text-anchor="middle">8</text>
+      </g>
+      <g class="stg" id="i-D2pm1">
+        <rect class="tent" x="360" y="410" width="280" height="56" rx="10"/>
+        <text class="h" x="500" y="432" text-anchor="middle">D2 @ j=p−1</text>
+        <text class="s" x="500" y="450" text-anchor="middle">fuse( z₁[p−1] , emb(d₁) )   TENTATIVE</text>
+        <text class="tiny" x="500" y="463" text-anchor="middle">z₁[p−1] = output of step 5 (this chain)</text>
+        <circle class="stepnum" cx="372" cy="422" r="9"/><text x="372" y="426" text-anchor="middle">9</text>
+      </g>
+      <g class="stg" id="i-D2p">
+        <rect class="tent" x="700" y="410" width="300" height="56" rx="10"/>
+        <text class="h" x="850" y="432" text-anchor="middle">D2 @ j=p :  fuse(z₁[p], emb(d₂))</text>
+        <text class="s" x="850" y="450" text-anchor="middle">→ z₂[p]   TENTATIVE (d₂ unverified)</text>
+        <text class="tiny" x="850" y="463" text-anchor="middle">z₁[p] comes from step 6</text>
+        <circle class="stepnum" cx="712" cy="422" r="9"/><text x="712" y="426" text-anchor="middle">10</text>
+      </g>
+      <g class="stg" id="i-pickd3">
+        <rect class="logit" x="1060" y="410" width="130" height="56" rx="10"/>
+        <text class="h" x="1125" y="432" text-anchor="middle">pick d₃</text>
+        <text class="s" x="1125" y="450" text-anchor="middle">z₂[p]·W_out → cₚ₊₄</text>
+        <text class="s" x="1125" y="463" text-anchor="middle">chain complete: 4 drafts</text>
+        <circle class="stepnum" cx="1072" cy="422" r="9"/><text x="1072" y="426" text-anchor="middle">11</text>
+      </g>
+      <path class="stg flow" id="i-wrapC" d="M815,336 L815,363 L165,363 L165,408"/>
+      <path class="stg flowg" id="i-d1cu-out" d="M180,336 L180,373 L500,373 L500,408"/>
+      <path class="stg flowd" id="i-d2feed" d="M528,74 L528,103 L380,103 L380,383 L830,383 L830,410"/>
+
+      <!-- ===== verify ===== -->
+      <g class="stg" id="i-verify">
+        <rect class="frozen" x="60" y="520" width="640" height="70" rx="10"/>
+        <text class="h" x="380" y="545" text-anchor="middle">VERIFY — backbone consumes d₀ d₁ d₂ d₃ in ONE batched RNN pass</text>
+        <text class="s" x="380" y="565" text-anchor="middle">→ preds₀..preds₃ = the backbone's own pick after each drafted token</text>
+        <text class="tiny" x="380" y="581" text-anchor="middle">d₀ needs no check — it IS the backbone's pick; comparisons start at preds₀ vs d₁</text>
+        <circle class="stepnum" cx="72" cy="532" r="9"/><text x="72" y="536" text-anchor="middle">12</text>
+      </g>
+      <path class="stg flow" id="i-drafts-to-verify" d="M632,52 L1215,52 L1215,505 L690,505 L690,516"/>
+      <text class="stg tiny" id="i-drafts-label" x="1150" y="44">drafts d₀..d₃</text>
+      <g class="stg" id="i-walk">
+        <rect class="neut" x="760" y="520" width="400" height="70" rx="10"/>
+        <text class="h" x="960" y="545" text-anchor="middle">greedy walk:  m ← 0</text>
+        <text class="s" x="960" y="565" text-anchor="middle">while preds[m] == d_(m+1):  m++   →  m ∈ {0,1,2,3}</text>
+        <text class="tiny" x="960" y="581" text-anchor="middle">per-depth acceptance stats: acc[j]/att[j]</text>
+        <circle class="stepnum" cx="772" cy="532" r="9"/><text x="772" y="536" text-anchor="middle">13</text>
+      </g>
+      <path class="stg flow" id="i-verify-to-walk" d="M700,555 L760,555"/>
+
+      <!-- ===== outcomes ===== -->
+      <g class="stg" id="i-out2">
+        <rect class="bad" x="60" y="640" width="350" height="76" rx="10"/>
+        <text class="h" x="235" y="664" text-anchor="middle">m = 0 — reject at first draft</text>
+        <text class="s" x="235" y="684" text-anchor="middle">emit 2: d₀ + preds₀</text>
+        <text class="s" x="235" y="701" text-anchor="middle">rollback backbone state → re-run over emitted</text>
+        <circle class="stepnum" cx="72" cy="652" r="9"/><text x="72" y="656" text-anchor="middle">14</text>
+      </g>
+      <g class="stg" id="i-outp">
+        <rect class="bad" x="440" y="640" width="350" height="76" rx="10"/>
+        <text class="h" x="615" y="664" text-anchor="middle">m ∈ {1,2} — partial accept</text>
+        <text class="s" x="615" y="684" text-anchor="middle">emit m+2: d₀..d_m + preds_m</text>
+        <text class="s" x="615" y="701" text-anchor="middle">rejected drafts discarded, state re-run</text>
+        <circle class="stepnum" cx="452" cy="652" r="9"/><text x="452" y="656" text-anchor="middle">14</text>
+      </g>
+      <g class="stg" id="i-out5">
+        <rect class="exact" x="820" y="640" width="380" height="76" rx="10"/>
+        <text class="h" x="1010" y="664" text-anchor="middle">m = 3 — all drafts accepted</text>
+        <text class="s" x="1010" y="684" text-anchor="middle">emit 5: d₀..d₃ (already consumed) + bonus preds₃</text>
+        <text class="s" x="1010" y="701" text-anchor="middle">the bonus token is free throughput</text>
+        <circle class="stepnum" cx="832" cy="652" r="9"/><text x="832" y="656" text-anchor="middle">14</text>
+      </g>
+      <path class="stg flow" id="i-walk-out2" d="M960,590 L960,615 L235,615 L235,636"/>
+      <path class="stg flow" id="i-walk-outp" d="M960,590 L960,615 L615,615 L615,636"/>
+      <path class="stg flow" id="i-walk-out5" d="M1010,590 L1010,636"/>
+
+      <!-- ===== advance ===== -->
+      <g class="stg" id="i-advance">
+        <rect class="neut" x="60" y="760" width="800" height="70" rx="10"/>
+        <text class="h" x="460" y="785" text-anchor="middle">RESTORE + ADVANCE — restore(snap); advance():</text>
+        <text class="s" x="460" y="805" text-anchor="middle">depth k re-ingests x_k[j] for j ∈ [p−k , p′−k−1] with COMMITTED tokens (p′ = p + emitted)</text>
+        <text class="tiny" x="460" y="821" text-anchor="middle">where drafts were accepted the committed tokens equal the drafts → values identical to the tentative chain</text>
+        <circle class="stepnum" cx="72" cy="772" r="9"/><text x="72" y="776" text-anchor="middle">15</text>
+      </g>
+      <path class="stg flow" id="i-out2-adv" d="M235,716 L235,756"/>
+      <path class="stg flow" id="i-outp-adv" d="M615,716 L615,756"/>
+      <path class="stg flow" id="i-out5-adv" d="M1010,716 L1010,740 L700,740 L700,756"/>
+      <path class="stg flow" id="i-loop" d="M60,795 L24,795 L24,178 L26,178"/>
+      <text class="stg tiny" id="i-loop-label" x="14" y="490" transform="rotate(-90 14 490)" text-anchor="middle">next round at p′</text>
+    </svg>
+
+    <div class="stepbox">
+      <span class="steptag" id="stepTag">SETUP</span>
+      <div class="steptitle" id="stepTitle"></div>
+      <div class="steptxt" id="stepTxt"></div>
+    </div>
+
+    <div class="note">
+      Why the catch-up cells (steps 5 &amp; 8) exist: depth k's input x_k[j] needs the token at stream
+      position j+k+1, so depth k always lags the stream end by k ingestions. Each round, the newly
+      committed token cₚ₊₁ unblocks exactly one pending input per depth (j = p−k) — the runner does this
+      bookkeeping anyway via <code>advance()</code>; the draft chain simply does it early, plus the one
+      tentative ingestion at j=p that produces the next draft.
+      <br><br>
+      Measured with this exact scheme (FastMTP, self-distilled shared head): conditional acceptance
+      ≈ <b>80%</b> (d₁) · <b>56%</b> (d₂) · <b>36%</b> (d₃) — versus vanilla head-reuse 70 / 11 / 2%.
+      The recurrent state carried across depths is precisely where the extra depth-2/3 acceptance comes from.
+    </div>
+  </div>
+</section>
+
+<footer>
+  Code: <code>mtp.py</code> — <code>RWKV7MTPModule</code> (module anatomy), <code>RWKVWithMTP.forward_loss</code> (training recursion),
+  <code>_teacher_topk</code>/<code>_FusedDistillCE</code> (distillation) ·
+  <code>spec_decode.py</code> — <code>RWKV7HeadRunner.prefill/snapshot/restore/draft_chain/advance</code>, <code>generate</code> (verify loop) ·
+  background: <code>fastmtp.md</code>, <code>MTP_README.md</code>
+</footer>
+</div>
+
+<script>
+(function(){
+  // ---- tabs ----
+  var btns = document.querySelectorAll('.tabs button');
+  btns.forEach(function(b){
+    b.addEventListener('click', function(){
+      btns.forEach(function(x){x.classList.remove('on');});
+      b.classList.add('on');
+      document.querySelectorAll('.tab').forEach(function(t){t.classList.remove('active');});
+      document.getElementById(b.dataset.tab).classList.add('active');
+    });
+  });
+
+  // ---- stepper ----
+  var steps = [
+    {tag:"SETUP",    t:"Snapshot the head state", ids:["i-snap","i-stream"],
+     x:"Before touching anything, clone every depth's WKV state and z-buffers (spec_decode.RWKV7HeadRunner.snapshot). This is the rollback point: if verification rejects drafts, the tentative ingestions are undone by restore() — as if they never happened."},
+    {tag:"BACKBONE", t:"The backbone picks d₀ = cₚ₊₁", ids:["i-hp","i-pickd0","i-pickd0-arrow","i-d0"],
+     x:"At the stream end p, the frozen backbone's own pick (h_p·W_out → argmax/sample) becomes draft d₀. This token is free: the backbone would emit it even without the MTP head, and it is committed immediately. That's why the chain always yields K+1 = 4 drafts for K=3."},
+    {tag:"DEPTH 0",  t:"Depth 0 ingests x₀[p] — EXACT", ids:["i-D0p","i-d0feed"],
+     x:"The head fuses the backbone hidden with the (now committed) token: x₀[p] = proj([ln_h(h_p) ; ln_tok(emb(cₚ₊₁))]) → one RWKV-7 block step → z₀[p]. Marked EXACT: both inputs are committed, so this state update will never be rolled back."},
+    {tag:"DEPTH 0",  t:"pick d₁ = cₚ₊₂ (tentative)", ids:["i-pickd1","i-pickd1-arrow","i-d1"],
+     x:"z₀[p]·W_out is sampled/argmaxed → d₁. From here on, everything the chain produces is TENTATIVE: it depends on a token the backbone has not yet verified."},
+    {tag:"DEPTH 1",  t:"Depth 1 catch-up @ j=p−1 — EXACT", ids:["i-D1cu","i-wrapB"],
+     x:"Depth k's input x_k[j] needs the token at stream position j+k+1 — depth 1 lags the stream end by one ingestion. The newly committed cₚ₊₁ unblocks exactly x₁[p−1]: fuse(zbuffer₀[p−1], emb(cₚ₊₁)) → z₁[p−1]. The z came from the persistent buffer (the 'watermark'), the token is committed → EXACT. This is state-advance work advance() would do anyway; draft_chain simply does it early."},
+    {tag:"DEPTH 1",  t:"Depth 1 ingests x₁[p] — TENTATIVE", ids:["i-D1p","i-d1feed"],
+     x:"fuse(z₀[p] (from this chain, step 3), emb(d₁) (unverified)) → z₁[p]. This is the same fuse+block computation as training's depth-1 row — only the token comes from the draft instead of the ground truth."},
+    {tag:"DEPTH 1",  t:"pick d₂ = cₚ₊₃ (tentative)", ids:["i-pickd2"],
+     x:"z₁[p]·W_out → d₂. Two tentative tokens are now in flight."},
+    {tag:"DEPTH 2",  t:"Depth 2 catch-up @ j=p−2 — EXACT", ids:["i-D2cu","i-wrapC"],
+     x:"Same pattern one depth deeper: fuse(zbuffer₁[p−2], emb(cₚ₊₁)) → z₂[p−2]. EXACT: committed token + buffered z."},
+    {tag:"DEPTH 2",  t:"Depth 2 @ j=p−1 — TENTATIVE", ids:["i-D2pm1","i-d1cu-out"],
+     x:"fuse(z₁[p−1] (produced by this chain's step 5), emb(d₁) (tentative)) → z₂[p−1]. Note the state input is chain-local, the token input is still the unverified d₁."},
+    {tag:"DEPTH 2",  t:"Depth 2 ingests x₂[p] — TENTATIVE", ids:["i-D2p","i-d2feed"],
+     x:"fuse(z₁[p] (step 6), emb(d₂)) → z₂[p]. Third link of the recursion — each depth consumes the previous depth's output as its 'hidden' input, exactly like training's z_{k-1,i}."},
+    {tag:"DEPTH 2",  t:"pick d₃ = cₚ₊₄ — chain complete", ids:["i-pickd3"],
+     x:"z₂[p]·W_out → d₃. The chain has produced K+1 = 4 drafts: d₀ (backbone's own) + 3 head drafts, at the cost of 3 small head steps + 3 picks."},
+    {tag:"VERIFY",   t:"Backbone verifies all 4 drafts in one pass", ids:["i-verify","i-drafts-to-verify","i-drafts-label","i-d0","i-d1","i-d2","i-d3"],
+     x:"The backbone runs ONE batched RNN forward over [d₀,d₁,d₂,d₃] and produces preds = its own pick after each drafted token. Speculative decoding is lossless: whatever the backbone says wins."},
+    {tag:"VERIFY",   t:"Greedy acceptance walk", ids:["i-walk","i-verify-to-walk"],
+     x:"m ← 0; while preds[m] == d₍ₘ₊₁₎: m++. d₀ is accepted by construction (it IS the backbone's pick). The first mismatch truncates the chain. Per-depth conditional acceptance is accumulated as acc[j]/att[j] here."},
+    {tag:"COMMIT",   t:"Commit 2–5 tokens", ids:["i-out2","i-outp","i-out5","i-walk-out2","i-walk-outp","i-walk-out5"],
+     x:"m=0 → emit 2 (d₀ + preds₀). m∈{1,2} → emit m+2 after discarding rejected drafts and re-running the backbone over the emitted tokens from the pre-verify state. m=3 → all four drafts were already consumed by the verify pass, so they are emitted plus the bonus token preds₃ — 5 tokens for one verify pass. The bonus is why mean tokens/step can exceed K+1."},
+    {tag:"STATE",    t:"Restore + advance the head state", ids:["i-advance","i-out2-adv","i-outp-adv","i-out5-adv","i-loop","i-loop-label"],
+     x:"restore(snap) undoes every tentative ingestion, then advance() re-ingests exactly the inputs that became final: depth k covers j ∈ [p−k, p′−k−1] with committed tokens. Where drafts were accepted, committed tokens equal the drafts, so the values match the tentative chain bit-for-bit — the speculative round leaves the head state exactly as if it had processed the stream normally. Then the loop repeats at p′ = p + emitted."}
+  ];
+
+  var cur = 0, timer = null;
+  var btnPrev = document.getElementById('btnPrev'),
+      btnNext = document.getElementById('btnNext'),
+      btnPlay = document.getElementById('btnPlay'),
+      btnFull = document.getElementById('btnFull'),
+      stepCnt = document.getElementById('stepCnt'),
+      stepTag = document.getElementById('stepTag'),
+      stepTitle = document.getElementById('stepTitle'),
+      stepTxt = document.getElementById('stepTxt'),
+      svg = document.getElementById('svginfer');
+  var full = false;
+
+  function render(){
+    var s = steps[cur];
+    svg.querySelectorAll('.stg').forEach(function(el){
+      el.classList.add('dim'); el.classList.remove('now');
+    });
+    for (var i = 0; i <= cur; i++){
+      steps[i].ids.forEach(function(id){
+        var el = document.getElementById(id);
+        if (el) el.classList.remove('dim');
+      });
+    }
+    s.ids.forEach(function(id){
+      var el = document.getElementById(id);
+      if (el) el.classList.add('now');
+    });
+    if (full) svg.querySelectorAll('.stg').forEach(function(el){el.classList.remove('dim');});
+    stepCnt.textContent = (cur+1) + ' / ' + steps.length;
+    stepTag.textContent = s.tag;
+    stepTitle.textContent = (cur+1) + '. ' + s.t;
+    stepTxt.textContent = s.x;
+    btnPrev.disabled = (cur === 0);
+    btnNext.disabled = (cur === steps.length-1);
+  }
+  function go(d){ var n = cur + d; if (n < 0 || n >= steps.length) return; cur = n; render(); }
+  btnPrev.addEventListener('click', function(){ stopPlay(); go(-1); });
+  btnNext.addEventListener('click', function(){ stopPlay(); go(1); });
+  btnFull.addEventListener('click', function(){
+    full = !full;
+    btnFull.textContent = full ? 'step mode' : 'show full diagram';
+    render();
+  });
+  function stopPlay(){ if (timer){ clearInterval(timer); timer = null; btnPlay.textContent = '▶ play'; } }
+  btnPlay.addEventListener('click', function(){
+    if (timer) { stopPlay(); return; }
+    if (cur >= steps.length-1) { cur = 0; }
+    btnPlay.textContent = '❚❚ pause';
+    timer = setInterval(function(){
+      if (cur >= steps.length-1) { stopPlay(); return; }
+      cur++; render();
+    }, 2600);
+  });
+  document.addEventListener('keydown', function(e){
+    if (!document.getElementById('tab-infer').classList.contains('active')) return;
+    if (e.key === 'ArrowRight') { stopPlay(); go(1); }
+    if (e.key === 'ArrowLeft')  { stopPlay(); go(-1); }
+  });
+  render();
+})();
+</script>
+</body>
+</html>
