@@ -17,8 +17,8 @@ THIS_DIR = Path(__file__).resolve().parent
 CUDA_DIR = THIS_DIR / "cuda"
 CUTLASS_INCLUDE_DIR = Path(os.environ.get(
     "CUTLASS_INCLUDE_DIR",
-    # Unlike parents[1], parent.parent is safe for shallow installs such as /app.
-    THIS_DIR.parent.parent / "third_party" / "cutlass" / "include",
+    # Repo root: <repo>/third_party/cutlass/include (same dir that contains faster3a_2607/).
+    THIS_DIR.parent / "third_party" / "cutlass" / "include",
 ))
 L,C,H,N,V = 0,0,0,HEAD_SIZE,0
 WKV_MODE = "fp16"
